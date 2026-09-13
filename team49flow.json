@@ -1,0 +1,548 @@
+[
+  {
+    "id": "mqtt-broker-hivemq",
+    "type": "mqtt-broker",
+    "name": "HiveMQ Public Broker",
+    "broker": "broker.hivemq.com",
+    "port": "1883",
+    "clientid": "",
+    "autoConnect": true,
+    "usetls": false,
+    "protocolVersion": "4",
+    "keepalive": "60",
+    "cleansession": true,
+    "autoUnsubscribe": true,
+    "birthTopic": "",
+    "birthQos": "0",
+    "birthPayload": "",
+    "birthMsg": {},
+    "closeTopic": "",
+    "closeQos": "0",
+    "closePayload": "",
+    "closeMsg": {},
+    "willTopic": "",
+    "willQos": "0",
+    "willPayload": "",
+    "willMsg": {},
+    "userProps": "",
+    "sessionExpiry": ""
+  },
+  {
+    "id": "mqtt-in-sensor",
+    "type": "mqtt in",
+    "z": "t49-tab",
+    "name": "ESP32 Sensor Data",
+    "topic": "sit/datacenters/sensorData",
+    "qos": "0",
+    "datatype": "auto-detect",
+    "broker": "mqtt-broker-hivemq",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 130,
+    "y": 60,
+    "wires": [
+      [
+        "json-parse-sensor"
+      ]
+    ]
+  },
+  {
+    "id": "json-parse-sensor",
+    "type": "json",
+    "z": "t49-tab",
+    "name": "Parse JSON Payload",
+    "property": "payload",
+    "action": "obj",
+    "pretty": false,
+    "x": 300,
+    "y": 60,
+    "wires": [
+      [
+        "fn-store-fuse"
+      ]
+    ]
+  },
+  {
+    "id": "t49-tab",
+    "type": "tab",
+    "label": "Server Room Monitor",
+    "disabled": false,
+    "info": ""
+  },
+  {
+    "id": "g-live",
+    "type": "ui_group",
+    "name": "Live Sensor Values",
+    "tab": "t49-tab",
+    "order": 1,
+    "disp": true,
+    "width": "6",
+    "collapse": false
+  },
+  {
+    "id": "g-chart",
+    "type": "ui_group",
+    "name": "Trends",
+    "tab": "t49-tab",
+    "order": 2,
+    "disp": true,
+    "width": "6",
+    "collapse": false
+  },
+  {
+    "id": "g-status",
+    "type": "ui_group",
+    "name": "Risk, Cooling & Alerts",
+    "tab": "t49-tab",
+    "order": 3,
+    "disp": true,
+    "width": "6",
+    "collapse": false
+  },
+  {
+    "id": "fn-store-fuse",
+    "type": "function",
+    "z": "t49-tab",
+    "name": "Store + Edge Intelligence (Risk Fusion)",
+    "func": "// Store incoming MQTT reading, maintain rolling history, and run edge intelligence.\nvar d = msg.payload || {};\n\nif (typeof d.temperature !== 'number' || typeof d.humidity !== 'number') {\n    return [null];\n}\n\n// ESP32 publishes LDR as a raw ADC value (0-4095).\n// Convert it to a percentage for the dashboard while retaining the raw value.\nvar lightRaw = (typeof d.light === 'number') ? d.light : 0;\nvar lightPct = (typeof d.lightPct === 'number') ? d.lightPct : Math.round((lightRaw / 4095) * 100);\nlightPct = Math.max(0, Math.min(100, lightPct));\n\nvar reading = {\n    deviceId: d.deviceId || \"Wokwi-ESP32\",\n    temperature: d.temperature,\n    humidity: d.humidity,\n    motion: (d.motion === 1 || d.motion === true) ? 1 : 0,\n    lightRaw: lightRaw,\n    lightPct: lightPct,\n    ts: Date.now()\n};\n\nvar history = flow.get('history') || [];\nhistory.push(reading);\nif (history.length > 100) history.shift();\nflow.set('history', history);\nflow.set('latest', reading);\n\n// Edge intelligence: combine environmental deviation, trends, and access anomaly.\nvar prevWindow = history.slice(-4);\nvar tempSeries = prevWindow.map(function(r){ return r.temperature; });\nvar humSeries  = prevWindow.map(function(r){ return r.humidity; });\nvar tempTrend = tempSeries.length > 1 ? (tempSeries[tempSeries.length-1] - tempSeries[0]) / (tempSeries.length-1) : 0;\nvar humTrend  = humSeries.length > 1 ? (humSeries[humSeries.length-1] - humSeries[0]) / (humSeries.length-1) : 0;\n\nvar TEMP_LOW = 18, TEMP_HIGH = 27;\nvar HUM_LOW = 40, HUM_HIGH = 60;\nvar LIGHT_LOW = 49; // approximately 2000/4095 converted to percent\n\nfunction bandDeviation(val, low, high) {\n    if (val < low) return low - val;\n    if (val > high) return val - high;\n    return 0;\n}\n\nvar tempDev = bandDeviation(reading.temperature, TEMP_LOW, TEMP_HIGH);\nvar humDev  = bandDeviation(reading.humidity, HUM_LOW, HUM_HIGH);\nvar prevLight = history.length > 1 ? history[history.length-2].lightPct : reading.lightPct;\nvar lightJump = reading.lightPct - prevLight;\nvar accessAnomaly = (reading.motion === 1 && lightJump > 15) ? 1 : 0;\nvar thermalRunaway = (tempTrend > 0.3 && humTrend > 0.5) ? 1 : 0;\n\nvar score = 0;\nscore += Math.min(tempDev * 8, 40);\nscore += Math.min(humDev * 3, 20);\nscore += thermalRunaway ? 20 : 0;\nscore += accessAnomaly ? 15 : 0;\nscore += Math.min(Math.max(tempTrend,0) * 10, 5);\nscore = Math.max(0, Math.min(100, Math.round(score)));\n\nvar level;\nif (score < 20) level = \"LOW\";\nelse if (score < 45) level = \"MEDIUM\";\nelse if (score < 70) level = \"HIGH\";\nelse level = \"CRITICAL\";\n\nvar cooling;\nif (reading.temperature > TEMP_HIGH && reading.humidity > HUM_HIGH) {\n    cooling = \"Increase cooling AND dehumidify - high thermal + moisture load\";\n} else if (thermalRunaway) {\n    cooling = \"Preemptively increase cooling - rising trend suggests HVAC lag\";\n} else if (reading.temperature > TEMP_HIGH) {\n    cooling = \"Increase cooling\";\n} else if (reading.temperature < TEMP_LOW) {\n    cooling = \"Reduce cooling - room overcooled, save energy\";\n} else if (reading.humidity > HUM_HIGH) {\n    cooling = \"Run dehumidifier - temperature OK but humidity elevated\";\n} else if (reading.motion === 0 && reading.lightPct < LIGHT_LOW) {\n    cooling = \"Normal - maintain current HVAC settings\";\n} else {\n    cooling = \"Normal - maintain current HVAC settings\";\n}\n\nvar risk = {\n    score: score,\n    level: level,\n    cooling: cooling,\n    tempTrend: Number(tempTrend.toFixed(2)),\n    humTrend: Number(humTrend.toFixed(2)),\n    accessAnomaly: accessAnomaly,\n    thermalRunaway: thermalRunaway,\n    ts: Date.now()\n};\nflow.set('risk', risk);\n\nif (level === \"HIGH\" || level === \"CRITICAL\") {\n    flow.set('alertActive', true);\n}\n\nvar dash = { reading: reading, risk: risk };\nreturn [dash];",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 500,
+    "y": 60,
+    "wires": [
+      [
+        "fn-dash-split"
+      ]
+    ]
+  },
+  {
+    "id": "fn-dash-split",
+    "type": "function",
+    "z": "t49-tab",
+    "name": "Split for Dashboard",
+    "func": "var out1 = { payload: msg.payload.reading.temperature };            // temp gauge\nvar out2 = { payload: msg.payload.reading.humidity };                // humidity gauge\nvar out3 = { payload: msg.payload.reading.lightPct };                 // light gauge\nvar out4 = { payload: msg.payload.reading.motion ? \"Motion Detected\" : \"No Motion\" }; // motion text\nvar out5 = { payload: { temperature: msg.payload.reading.temperature, humidity: msg.payload.reading.humidity } }; // chart (multi-series via 2 msgs below instead)\nvar out6 = { payload: msg.payload.risk.level + \" (\" + msg.payload.risk.score + \"/100)\" }; // risk text\nvar out7 = { payload: msg.payload.risk.cooling };                     // cooling recommendation\nvar out8 = null;\nif (msg.payload.risk.level === \"HIGH\" || msg.payload.risk.level === \"CRITICAL\") {\n    out8 = { payload: \"\\u26A0 \" + msg.payload.risk.level + \" RISK: \" + msg.payload.risk.cooling };\n}\nvar tempPoint = { payload: msg.payload.reading.temperature, topic: \"Temperature\" };\nvar humPoint  = { payload: msg.payload.reading.humidity, topic: \"Humidity\" };\nreturn [out1, out2, out3, out4, [tempPoint, humPoint], out6, out7, out8];",
+    "outputs": 8,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 420,
+    "y": 160,
+    "wires": [
+      [
+        "ui-gauge-temp"
+      ],
+      [
+        "ui-gauge-hum"
+      ],
+      [
+        "ui-gauge-light"
+      ],
+      [
+        "ui-text-motion"
+      ],
+      [
+        "ui-chart-trend"
+      ],
+      [
+        "ui-text-risk"
+      ],
+      [
+        "ui-text-cooling"
+      ],
+      [
+        "ui-notify-alert"
+      ]
+    ]
+  },
+  {
+    "id": "ui-gauge-temp",
+    "type": "ui_gauge",
+    "z": "t49-tab",
+    "name": "Temperature",
+    "group": "g-live",
+    "order": 1,
+    "width": 0,
+    "height": 0,
+    "gtype": "gage",
+    "title": "Temperature (°C)",
+    "label": "°C",
+    "format": "{{value}}",
+    "min": 0,
+    "max": 50,
+    "colors": [
+      "#00b500",
+      "#e6e600",
+      "#ca3838"
+    ],
+    "seg1": "27",
+    "seg2": "32",
+    "x": 700,
+    "y": 100,
+    "wires": []
+  },
+  {
+    "id": "ui-gauge-hum",
+    "type": "ui_gauge",
+    "z": "t49-tab",
+    "name": "Humidity",
+    "group": "g-live",
+    "order": 2,
+    "width": 0,
+    "height": 0,
+    "gtype": "gage",
+    "title": "Humidity (%)",
+    "label": "%",
+    "format": "{{value}}",
+    "min": 0,
+    "max": 100,
+    "colors": [
+      "#00b500",
+      "#e6e600",
+      "#ca3838"
+    ],
+    "seg1": "60",
+    "seg2": "75",
+    "x": 700,
+    "y": 140,
+    "wires": []
+  },
+  {
+    "id": "ui-gauge-light",
+    "type": "ui_gauge",
+    "z": "t49-tab",
+    "name": "Light Level",
+    "group": "g-live",
+    "order": 3,
+    "width": 0,
+    "height": 0,
+    "gtype": "gage",
+    "title": "Light Level (%)",
+    "label": "%",
+    "format": "{{value}}",
+    "min": 0,
+    "max": 100,
+    "colors": [
+      "#0033cc",
+      "#3399ff",
+      "#e6e600"
+    ],
+    "seg1": "40",
+    "seg2": "70",
+    "x": 700,
+    "y": 180,
+    "wires": []
+  },
+  {
+    "id": "ui-text-motion",
+    "type": "ui_text",
+    "z": "t49-tab",
+    "group": "g-live",
+    "order": 4,
+    "width": 0,
+    "height": 0,
+    "name": "Motion Status",
+    "label": "Motion",
+    "format": "{{msg.payload}}",
+    "layout": "row-spread",
+    "x": 700,
+    "y": 220,
+    "wires": []
+  },
+  {
+    "id": "ui-chart-trend",
+    "type": "ui_chart",
+    "z": "t49-tab",
+    "name": "Temp & Humidity Trend",
+    "group": "g-chart",
+    "order": 1,
+    "width": 0,
+    "height": 0,
+    "label": "Trend",
+    "chartType": "line",
+    "legend": "true",
+    "xformat": "HH:mm:ss",
+    "interpolate": "linear",
+    "nodata": "",
+    "dot": false,
+    "ymin": "",
+    "ymax": "",
+    "removeOlder": 1,
+    "removeOlderPoints": "",
+    "removeOlderUnit": "3600",
+    "cutout": 0,
+    "useOneColor": false,
+    "useUTC": false,
+    "colors": [
+      "#1f77b4",
+      "#ff7f0e",
+      "#2ca02c",
+      "#98df8a",
+      "#d62728",
+      "#ff9896",
+      "#9467bd",
+      "#c5b0d5",
+      "#8c564b",
+      "#c49c94"
+    ],
+    "x": 700,
+    "y": 260,
+    "wires": [
+      [],
+      []
+    ]
+  },
+  {
+    "id": "ui-text-risk",
+    "type": "ui_text",
+    "z": "t49-tab",
+    "group": "g-status",
+    "order": 1,
+    "width": 0,
+    "height": 0,
+    "name": "Risk Level",
+    "label": "Server Room Risk",
+    "format": "{{msg.payload}}",
+    "layout": "row-spread",
+    "x": 700,
+    "y": 300,
+    "wires": []
+  },
+  {
+    "id": "ui-text-cooling",
+    "type": "ui_text",
+    "z": "t49-tab",
+    "group": "g-status",
+    "order": 2,
+    "width": 0,
+    "height": 0,
+    "name": "Cooling Recommendation",
+    "label": "Cooling Recommendation",
+    "format": "{{msg.payload}}",
+    "layout": "row-spread",
+    "x": 700,
+    "y": 340,
+    "wires": []
+  },
+  {
+    "id": "ui-notify-alert",
+    "type": "ui_toast",
+    "z": "t49-tab",
+    "position": "top right",
+    "displayTime": "6",
+    "highlight": "",
+    "sendall": true,
+    "outputs": 0,
+    "ok": "OK",
+    "cancel": "",
+    "raw": false,
+    "topic": "Alert",
+    "name": "Alert Toast",
+    "x": 700,
+    "y": 380,
+    "wires": []
+  },
+  {
+    "id": "http-in-latest",
+    "type": "http in",
+    "z": "t49-tab",
+    "name": "GET /api/latest",
+    "url": "/api/latest",
+    "method": "get",
+    "upload": false,
+    "swaggerDoc": "",
+    "x": 140,
+    "y": 460,
+    "wires": [
+      [
+        "fn-latest"
+      ]
+    ]
+  },
+  {
+    "id": "fn-latest",
+    "type": "function",
+    "z": "t49-tab",
+    "name": "Build response",
+    "func": "msg.payload = flow.get('latest') || {};\nmsg.statusCode = msg.payload.ts ? 200 : 204;\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 380,
+    "y": 460,
+    "wires": [
+      [
+        "http-resp-latest"
+      ]
+    ]
+  },
+  {
+    "id": "http-resp-latest",
+    "type": "http response",
+    "z": "t49-tab",
+    "name": "",
+    "statusCode": "",
+    "headers": {},
+    "x": 600,
+    "y": 460,
+    "wires": []
+  },
+  {
+    "id": "http-in-history",
+    "type": "http in",
+    "z": "t49-tab",
+    "name": "GET /api/history",
+    "url": "/api/history",
+    "method": "get",
+    "upload": false,
+    "swaggerDoc": "",
+    "x": 140,
+    "y": 520,
+    "wires": [
+      [
+        "fn-history"
+      ]
+    ]
+  },
+  {
+    "id": "fn-history",
+    "type": "function",
+    "z": "t49-tab",
+    "name": "Build response",
+    "func": "var n = Number(msg.req.query.limit) || 20;\nvar hist = flow.get('history') || [];\nmsg.payload = hist.slice(-n);\nmsg.statusCode = 200;\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 380,
+    "y": 520,
+    "wires": [
+      [
+        "http-resp-history"
+      ]
+    ]
+  },
+  {
+    "id": "http-resp-history",
+    "type": "http response",
+    "z": "t49-tab",
+    "name": "",
+    "statusCode": "",
+    "headers": {},
+    "x": 600,
+    "y": 520,
+    "wires": []
+  },
+  {
+    "id": "http-in-risk",
+    "type": "http in",
+    "z": "t49-tab",
+    "name": "GET /api/risk",
+    "url": "/api/risk",
+    "method": "get",
+    "upload": false,
+    "swaggerDoc": "",
+    "x": 140,
+    "y": 580,
+    "wires": [
+      [
+        "fn-risk"
+      ]
+    ]
+  },
+  {
+    "id": "fn-risk",
+    "type": "function",
+    "z": "t49-tab",
+    "name": "Build response",
+    "func": "msg.payload = flow.get('risk') || { level: 'UNKNOWN', score: 0, cooling: 'No data yet' };\nmsg.statusCode = 200;\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 380,
+    "y": 580,
+    "wires": [
+      [
+        "http-resp-risk"
+      ]
+    ]
+  },
+  {
+    "id": "http-resp-risk",
+    "type": "http response",
+    "z": "t49-tab",
+    "name": "",
+    "statusCode": "",
+    "headers": {},
+    "x": 600,
+    "y": 580,
+    "wires": []
+  },
+  {
+    "id": "http-in-ack",
+    "type": "http in",
+    "z": "t49-tab",
+    "name": "POST /api/alert/ack",
+    "url": "/api/alert/ack",
+    "method": "post",
+    "upload": false,
+    "swaggerDoc": "",
+    "x": 150,
+    "y": 640,
+    "wires": [
+      [
+        "fn-ack"
+      ]
+    ]
+  },
+  {
+    "id": "fn-ack",
+    "type": "function",
+    "z": "t49-tab",
+    "name": "Clear alert",
+    "func": "flow.set('alertActive', false);\nmsg.statusCode = 200;\nmsg.payload = { status: 'acknowledged', ts: Date.now() };\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 400,
+    "y": 640,
+    "wires": [
+      [
+        "http-resp-ack"
+      ]
+    ]
+  },
+  {
+    "id": "http-resp-ack",
+    "type": "http response",
+    "z": "t49-tab",
+    "name": "",
+    "statusCode": "",
+    "headers": {},
+    "x": 620,
+    "y": 640,
+    "wires": []
+  },
+  {
+    "id": "comment-architecture",
+    "type": "comment",
+    "z": "t49-tab",
+    "name": "Actual project architecture: ESP32/Wokwi -> MQTT -> Node-RED -> Dashboard",
+    "info": "ESP32/Wokwi publishes JSON sensor telemetry to HiveMQ topic sit/datacenters/sensorData. Node-RED parses the MQTT payload, stores recent readings, computes risk/cooling recommendations, and feeds the dashboard widgets.",
+    "x": 420,
+    "y": 700,
+    "wires": []
+  }
+]
